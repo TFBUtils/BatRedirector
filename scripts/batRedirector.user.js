@@ -16,7 +16,7 @@
 
 (() => {
   'use strict';
-//you can edit configs here (they might get overwritten on updates though so back them up pls!! smile)
+ //you can edit configs here (they might get overwritten on updates though so back them up pls!! smile)
   const RAW_BASE = 'https://raw.githubusercontent.com/TFBUtils/dependancies/batdirector/data/';
   const HANDLE_URL = RAW_BASE + 'channelHandle.txt';
   const ID_URL = RAW_BASE + 'channelID.txt';
@@ -27,11 +27,12 @@
   const OVERLAY_TEXT = 'redirecting to channel\'s ID';
   const REWRITE_LINKS = true;
   const REWRITE_ALL_PAGES = true;
-  const REWRITE_DELAY_MS = 269;
+  const REWRITE_DELAY_MS = 150;
   const INTERCEPT_CLICKS = true;
   const SPA_NAVIGATE = true;
+  const SPA_URL_SWAP = true;
   const LOOP_GUARD_MS = 15000;
-//easy configs end here, everything below this is super duper scary and advanced!!!
+ //easy configs end here, everything below this is super duper scary and advanced!!!
   const CACHE_MS = CACHE_MINUTES * 60 * 1000;
   const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
   const HANDLE_PATH_RE = /^\/@([^/]+)(\/.*)?$/;
@@ -233,12 +234,53 @@
   }
 
   let running = false;
-  const lastSpaNav = new Map();
 
-  async function check() {
+  function swapUrl(target) {
+    try {
+      const h = unsafeWindow.history;
+      h.replaceState(h.state, '', target);
+      return true;
+    } catch (e) {
+      log('url swap failed:', e);
+      return false;
+    }
+  }
+
+  async function swapSpaUrl(attempt) {
     const parsed = parseHandlePath(location.pathname);
-    if (!parsed || running) return;
-    if (Date.now() - (lastSpaNav.get(parsed.handle) || 0) < LOOP_GUARD_MS) return;
+    if (!parsed) return true;
+
+    try {
+      const entry = await findEntry(parsed.handle);
+      if (!entry) return true;
+
+      const id = await getId(entry);
+      if (!id) return true;
+
+      const now = parseHandlePath(location.pathname);
+      if (!now || now.handle !== parsed.handle) return true;
+
+      const target = `/channel/${id}${now.rest}${location.search}${location.hash}`;
+      if (!swapUrl(target)) return false;
+      log('swapped url to', target);
+
+      if (attempt < 2) setTimeout(() => swapSpaUrl(attempt + 1), 600);
+      return true;
+    } catch (e) {
+      log('error:', e);
+      return true;
+    }
+  }
+
+  async function check(fromSpa) {
+    const parsed = parseHandlePath(location.pathname);
+    if (!parsed) return;
+
+    if (fromSpa) {
+      if (!SPA_URL_SWAP) return;
+      if (await swapSpaUrl(0)) return;
+    }
+    if (running) return;
 
     running = true;
     let redirecting = false;
@@ -359,14 +401,13 @@
     }
   }
 
-  function trySpaClick(href, handle) {
+  function trySpaClick(href) {
     const m = new URL(href, location.origin).pathname.match(/^\/channel\/(UC[\w-]{22})\/?$/);
     if (!m) return false;
 
     const from = location.href;
     if (!spaNavigate(m[1])) return false;
 
-    lastSpaNav.set(handle, Date.now());
     setTimeout(() => {
       if (location.href !== from) return;
       log('spa navigation didnt work, falling back to a direct url load (which will reload the page :D)');
@@ -388,7 +429,7 @@
 
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (SPA_NAVIGATE && trySpaClick(link.href, link.dataset.batdirector)) return;
+      if (SPA_NAVIGATE && trySpaClick(link.href)) return;
 
       showOverlay();
       location.assign(link.href);
@@ -396,12 +437,14 @@
     true
   );
 
-  const onNavigate = () => {
-    check();
+  const onSpaNavigate = () => {
+    check(true);
     queueRewrite();
   };
 
-  onNavigate();
-  window.addEventListener('yt-navigate-finish', onNavigate);
-  window.addEventListener('popstate', onNavigate);
+  check(false);
+  queueRewrite();
+  window.addEventListener('yt-navigate-finish', onSpaNavigate);
+  window.addEventListener('yt-page-data-updated', onSpaNavigate, true);
+  window.addEventListener('popstate', onSpaNavigate);
 })();
