@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Bat Redirector
-// @namespace    https://github.com/TFBUtils
-// @version      1.0.0.1
+// @namespace    /TFBUtils/BatRedirector
+// @version      1.0.0.0
 // @description  Replaces and redirects instances of Firebat's @handle URL with her Channel ID URL :D
 // @match        https://www.youtube.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      raw.githubusercontent.com
 // @updateURL    https://raw.githubusercontent.com/TFBUtils/BatRedirector/stable/scripts/batRedirector.user.js
@@ -14,43 +16,116 @@
 
 (() => {
   'use strict';
-
+//you can edit configs here (they might get overwritten on updates though so back them up pls!! smile)
   const RAW_BASE = 'https://raw.githubusercontent.com/TFBUtils/dependancies/batdirector/data/';
   const HANDLE_URL = RAW_BASE + 'channelHandle.txt';
   const ID_URL = RAW_BASE + 'channelID.txt';
 
   const PREFER_YOUTUBE_ID = true;
+  const CACHE_MINUTES = 30;
   const SHOW_OVERLAY = true;
   const OVERLAY_TEXT = 'redirecting to channel\'s ID';
-  const REWRITE_SEARCH_LINKS = true;
+  const REWRITE_LINKS = true;
+  const REWRITE_ALL_PAGES = true;
+  const REWRITE_DELAY_MS = 269;
   const INTERCEPT_CLICKS = true;
   const SPA_NAVIGATE = true;
   const LOOP_GUARD_MS = 15000;
-
+//easy configs end here, everything below this is super duper scary and advanced!!!
+  const CACHE_MS = CACHE_MINUTES * 60 * 1000;
   const CHANNEL_ID_RE = /^UC[\w-]{22}$/;
   const HANDLE_PATH_RE = /^\/@([^/]+)(\/.*)?$/;
   const log = (...a) => console.log('[batdirector]', ...a);
 
-  const cache = {};
+  function cacheRead(key) {
+    if (CACHE_MS <= 0) return null;
+    try {
+      const raw = GM_getValue('cache:' + key, '');
+      if (!raw) return null;
+      const { t, v } = JSON.parse(raw);
+      return { value: v, fresh: Date.now() - t < CACHE_MS };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function cacheWrite(key, value) {
+    if (CACHE_MS <= 0) return;
+    try {
+      GM_setValue('cache:' + key, JSON.stringify({ t: Date.now(), v: value }));
+    } catch (_) {}
+  }
+
+  const memo = {};
 
   function gmGet(url) {
-    if (cache[url]) return cache[url];
-    cache[url] = new Promise((resolve, reject) => {
+    if (memo[url]) return memo[url];
+
+    const cached = cacheRead(url);
+    if (cached && cached.fresh) {
+      memo[url] = Promise.resolve(cached.value);
+      return memo[url];
+    }
+
+    memo[url] = new Promise((resolve, reject) => {
+      const fail = (err) => {
+        if (cached) {
+          log('using a stale cached copy of', url);
+          resolve(cached.value);
+        } else {
+          reject(err);
+        }
+      };
+
       GM_xmlhttpRequest({
         method: 'GET',
         url,
-        onload: (r) =>
-          r.status >= 200 && r.status < 300
-            ? resolve(r.responseText.trim())
-            : reject(new Error(url + ' -> HTTP ' + r.status)),
-        onerror: () => reject(new Error('network error for ' + url)),
+        onload: (r) => {
+          if (r.status >= 200 && r.status < 300) {
+            const text = r.responseText.trim();
+            cacheWrite(url, text);
+            resolve(text);
+          } else {
+            fail(new Error(url + ' -> HTTP ' + r.status));
+          }
+        },
+        onerror: () => fail(new Error('network error for ' + url)),
       });
     });
-    return cache[url];
+
+    memo[url].catch(() => delete memo[url]);
+    return memo[url];
   }
 
-  function getRepoHandle() {
-    return gmGet(HANDLE_URL).then((t) => t.replace(/^@/, '').toLowerCase());
+  function parseLines(text) {
+    return text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+  }
+
+  let entriesPromise = null;
+
+  function getEntries() {
+    if (!entriesPromise) {
+      entriesPromise = Promise.all([gmGet(HANDLE_URL), gmGet(ID_URL).catch(() => '')]).then(([handleText, idText]) => {
+        const handles = parseLines(handleText);
+        const ids = parseLines(idText);
+        return handles.map((line, n) => ({
+          handle: line.replace(/^@/, '').toLowerCase(),
+          id: CHANNEL_ID_RE.test(ids[n] || '') ? ids[n] : null,
+        }));
+      });
+      entriesPromise.catch(() => {
+        entriesPromise = null;
+      });
+    }
+    return entriesPromise;
+  }
+
+  async function findEntry(handle) {
+    const entries = await getEntries();
+    return entries.find((e) => e.handle === handle) || null;
   }
 
   function parseHandlePath(pathname) {
@@ -63,9 +138,9 @@
     return { handle: handle.toLowerCase(), rest: m[2] || '' };
   }
 
-  async function idFromYouTube(pageUrl) {
+  async function idFromYouTube(handle) {
     try {
-      const res = await fetch(pageUrl, { credentials: 'same-origin' });
+      const res = await fetch('/@' + encodeURIComponent(handle), { credentials: 'same-origin' });
       const html = await res.text();
       const m =
         html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/) ||
@@ -78,37 +153,35 @@
     }
   }
 
-  async function idFromRepo() {
-    try {
-      const id = await gmGet(ID_URL);
-      return CHANNEL_ID_RE.test(id) ? id : null;
-    } catch (e) {
-      log('repo ID lookup failed:', e);
-      return null;
-    }
-  }
+  async function resolveId(entry) {
+    const cached = cacheRead('id:' + entry.handle);
+    if (cached && cached.fresh && CHANNEL_ID_RE.test(cached.value)) return cached.value;
 
-  async function resolveId(pageUrl) {
     const sources = PREFER_YOUTUBE_ID
-      ? [() => idFromYouTube(pageUrl), idFromRepo]
-      : [idFromRepo, () => idFromYouTube(pageUrl)];
+      ? [() => idFromYouTube(entry.handle), () => entry.id]
+      : [() => entry.id, () => idFromYouTube(entry.handle)];
+
     for (const get of sources) {
       const id = await get();
-      if (id) return id;
+      if (id) {
+        cacheWrite('id:' + entry.handle, id);
+        return id;
+      }
     }
     return null;
   }
 
-  let idPromise = null;
+  const idCache = new Map();
 
-  function getId(pageUrl) {
-    if (!idPromise) {
-      idPromise = resolveId(pageUrl).then((id) => {
-        if (!id) idPromise = null;
+  function getId(entry) {
+    if (!idCache.has(entry.handle)) {
+      const p = resolveId(entry).then((id) => {
+        if (!id) idCache.delete(entry.handle);
         return id;
       });
+      idCache.set(entry.handle, p);
     }
-    return idPromise;
+    return idCache.get(entry.handle);
   }
 
   let overlay = null;
@@ -160,23 +233,24 @@
   }
 
   let running = false;
-  let lastSpaNav = 0;
+  const lastSpaNav = new Map();
 
   async function check() {
     const parsed = parseHandlePath(location.pathname);
     if (!parsed || running) return;
-    if (Date.now() - lastSpaNav < LOOP_GUARD_MS) return;
+    if (Date.now() - (lastSpaNav.get(parsed.handle) || 0) < LOOP_GUARD_MS) return;
 
     running = true;
     let redirecting = false;
 
     try {
-      const repoHandle = await getRepoHandle();
-      if (!repoHandle || parsed.handle !== repoHandle) return;
+      const entry = await findEntry(parsed.handle);
+      if (!entry) return;
 
+      const guardKey = 'batdirector-last:' + entry.handle;
       let recent = false;
       try {
-        recent = Date.now() - Number(sessionStorage.getItem('batdirector-last') || 0) < LOOP_GUARD_MS;
+        recent = Date.now() - Number(sessionStorage.getItem(guardKey) || 0) < LOOP_GUARD_MS;
       } catch (_) {}
       if (recent) {
         log('redirected recently, skipping because loops suck');
@@ -185,14 +259,14 @@
 
       showOverlay();
 
-      const id = await getId(location.href);
+      const id = await getId(entry);
       if (!id) {
         log('the handle matches, but no valid channel ID could be found');
         return;
       }
 
       try {
-        sessionStorage.setItem('batdirector-last', String(Date.now()));
+        sessionStorage.setItem(guardKey, String(Date.now()));
       } catch (_) {}
 
       const target = `https://www.youtube.com/channel/${id}${parsed.rest}${location.search}${location.hash}`;
@@ -209,38 +283,45 @@
 
   let queued = false;
 
-  async function rewriteSearchLinks() {
+  async function rewriteLinks() {
     queued = false;
-    if (!REWRITE_SEARCH_LINKS || location.pathname !== '/results') return;
+    if (!REWRITE_LINKS || (!REWRITE_ALL_PAGES && location.pathname !== '/results')) return;
 
     try {
-      const handle = await getRepoHandle();
-      if (!handle) return;
+      const entries = await getEntries();
+      if (!entries.length) return;
+      const byHandle = new Map(entries.map((e) => [e.handle, e]));
 
       const matches = [];
       for (const a of document.querySelectorAll('a[href*="/@"]')) {
         if (!a.hostname.endsWith('youtube.com')) continue;
         const parsed = parseHandlePath(a.pathname);
-        if (parsed && parsed.handle === handle) matches.push([a, parsed.rest]);
+        const entry = parsed && byHandle.get(parsed.handle);
+        if (entry) matches.push([a, entry, parsed.rest]);
       }
       if (!matches.length) return;
 
-      const id = await getId('/@' + handle);
-      if (!id) return;
+      const ids = new Map();
+      for (const [, entry] of matches) {
+        if (!ids.has(entry)) ids.set(entry, await getId(entry));
+      }
 
-      for (const [a, rest] of matches) {
+      for (const [a, entry, rest] of matches) {
+        const id = ids.get(entry);
+        if (!id) continue;
         a.href = `/channel/${id}${rest}${a.search}${a.hash}`;
-        a.dataset.batdirector = '1';
+        if (!rest) a.dataset.batdirector = entry.handle;
       }
     } catch (e) {
-      log('search rewrite error:', e);
+      log('link rewrite error:', e);
     }
   }
 
   function queueRewrite() {
-    if (queued || location.pathname !== '/results') return;
+    if (queued || !REWRITE_LINKS) return;
+    if (!REWRITE_ALL_PAGES && location.pathname !== '/results') return;
     queued = true;
-    requestAnimationFrame(rewriteSearchLinks);
+    setTimeout(rewriteLinks, REWRITE_DELAY_MS);
   }
 
   new MutationObserver(queueRewrite).observe(document.documentElement, {
@@ -273,22 +354,22 @@
       app.fire('yt-navigate', detail);
       return true;
     } catch (e) {
-      log('pwa navigation failed:', e);
+      log('spa navigation failed:', e);
       return false;
     }
   }
 
-  function trySpaClick(href) {
+  function trySpaClick(href, handle) {
     const m = new URL(href, location.origin).pathname.match(/^\/channel\/(UC[\w-]{22})\/?$/);
     if (!m) return false;
 
     const from = location.href;
     if (!spaNavigate(m[1])) return false;
 
-    lastSpaNav = Date.now();
+    lastSpaNav.set(handle, Date.now());
     setTimeout(() => {
       if (location.href !== from) return;
-      log('pwa navigation didnt work, falling back to a direct url load (which will reload thhe page :D)');
+      log('spa navigation didnt work, falling back to a direct url load (which will reload the page :D)');
       showOverlay();
       location.assign(href);
     }, 3000);
@@ -307,7 +388,7 @@
 
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (SPA_NAVIGATE && trySpaClick(link.href)) return;
+      if (SPA_NAVIGATE && trySpaClick(link.href, link.dataset.batdirector)) return;
 
       showOverlay();
       location.assign(link.href);
